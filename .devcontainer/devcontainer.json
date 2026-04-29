@@ -1,0 +1,20 @@
+{
+  "name": "ros-dev",
+  "image": "ros-noetic-configurado:latest",
+
+  "runArgs": [
+    "--add-host=shl00-250212aa:100.99.163.44",
+    "--cap-add=NET_ADMIN",
+    "--device=/dev/net/tun",
+    "--network=host",
+    "--cap-add=SYS_MODULE"
+
+  ],
+
+  "containerEnv": {
+    "ROS_MASTER_URI": "http://100.99.163.44:11311",
+    "ROS_IP": "100.66.38.5"
+  },
+
+  "postStartCommand": "python3 /workspace/Robotnik/test_scripts/hola.py"
+}
