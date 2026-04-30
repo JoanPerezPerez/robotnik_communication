@@ -4,8 +4,8 @@ import time
 client = roslibpy.Ros(host='100.99.163.44', port=9090)
 client.run()
 
-LAT=41.3874
-LON=2.1686
+LAT = 41.275929
+LON = 1.987814
 
 time.sleep(2)
 
@@ -23,7 +23,7 @@ service = roslibpy.Service(
 
 request = roslibpy.ServiceRequest({
     'procedure': {
-        'frame_id': 'gps',
+        'frame_id': 'utm',
         'goals': [
             {
                 'latitude': LAT,
@@ -34,8 +34,8 @@ request = roslibpy.ServiceRequest({
     }
 })
 
-result = service.call(request)
+#result = service.call(request)
 
-print(result)
+print(request)
 
 client.terminate()
