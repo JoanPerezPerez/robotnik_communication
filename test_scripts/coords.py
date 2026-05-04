@@ -23,7 +23,6 @@ service = roslibpy.Service(
 
 request = roslibpy.ServiceRequest({
     'procedure': {
-        'frame_id': 'utm',
         'goals': [
             {
                 'latitude': LAT,
@@ -34,8 +33,9 @@ request = roslibpy.ServiceRequest({
     }
 })
 
-#result = service.call(request)
+result = service.call(request)
 
 print(request)
+print(result)
 
 client.terminate()

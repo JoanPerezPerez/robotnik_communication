@@ -164,3 +164,21 @@ class RobotController:
                 break
 
             time.sleep(0.2)
+if __name__ == "__main__":
+    HOST = "100.99.163.44" # o la IP del robot
+
+    controller = RobotController(HOST)
+    controller.connect()
+
+    # Coordenadas objetivo (ejemplo)
+    goal_lat = 41.275929
+    goal_lon = 1.987814
+
+    try:
+        controller.go_to(goal_lat, goal_lon)
+    except KeyboardInterrupt:
+        print("Interrumpido por el usuario")
+    finally:
+        controller.nav.stop()
+        controller.client.terminate()
+        print("ROS desconectado")

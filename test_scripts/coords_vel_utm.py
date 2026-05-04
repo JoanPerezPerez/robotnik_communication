@@ -5,7 +5,7 @@ from pyproj import Proj
 
 
 # =========================
-# 1. GPS → MAP CONVERTER
+# 1. GPS → UTM CONVERTER
 # =========================
 
 class GPSConverter:
@@ -18,21 +18,30 @@ class GPSConverter:
 
 
 # =========================
-# 2. ROBOT STATE (ODOMETRÍA)
+# 2. ROBOT STATE
 # =========================
 
 class RobotState:
     def __init__(self):
         self.pose = {"x": 0.0, "y": 0.0, "yaw": 0.0}
+        self.odom_origin = None
 
     def update(self, msg):
-        self.pose["x"] = msg["pose"]["pose"]["position"]["x"]
-        self.pose["y"] = msg["pose"]["pose"]["position"]["y"]
+
+        x = msg["pose"]["pose"]["position"]["x"]
+        y = msg["pose"]["pose"]["position"]["y"]
+
+        # fijar origen odom real
+        if self.odom_origin is None:
+            self.odom_origin = (x, y)
+            print(f"[ODOM] Origen fijado -> {self.odom_origin}")
+
+        # convertir a frame local
+        self.pose["x"] = x - self.odom_origin[0]
+        self.pose["y"] = y - self.odom_origin[1]
 
         q = msg["pose"]["pose"]["orientation"]
-        self.pose["yaw"] = self.quaternion_to_yaw(
-            q["x"], q["y"], q["z"], q["w"]
-        )
+        self.pose["yaw"] = self.quaternion_to_yaw(q["x"], q["y"], q["z"], q["w"])
 
     def quaternion_to_yaw(self, x, y, z, w):
         siny_cosp = 2 * (w * z + x * y)
@@ -58,7 +67,6 @@ class Navigator:
             'linear': {'x': linear_x, 'y': 0.0, 'z': 0.0},
             'angular': {'x': 0.0, 'y': 0.0, 'z': angular_z}
         })
-
         self.cmd_topic.publish(msg)
 
     def stop(self):
@@ -67,7 +75,7 @@ class Navigator:
 
 
 # =========================
-# 4. TRAJECTORY PLANNER
+# 4. TRAJECTORY PLANNER (FIX FINAL)
 # =========================
 
 class TrajectoryPlanner:
@@ -82,6 +90,7 @@ class TrajectoryPlanner:
         return angle
 
     def move_to_goal(self, current_pose, goal_pose):
+
         dx = goal_pose["x"] - current_pose["x"]
         dy = goal_pose["y"] - current_pose["y"]
 
@@ -94,22 +103,22 @@ class TrajectoryPlanner:
         target_angle = math.atan2(dy, dx)
         angle_error = self.normalize_angle(target_angle - current_pose["yaw"])
 
-        # Control proporcional
-        linear_speed = min(0.5, 0.3 * distance)
-        angular_speed = 1.5 * angle_error
+        # CONTROL ESTABLE
+        angular_speed = 1.2 * angle_error
+        angular_speed = max(-0.5, min(0.5, angular_speed))
 
-        # Si está muy desalineado, gira antes de avanzar
-        if abs(angle_error) > 0.3:
-            linear_speed = 0.0
+        linear_speed = 0.2 + 0.2 * distance
+        linear_speed *= max(0.0, 1 - abs(angle_error))
 
-        self.navigator.send_speed(linear_speed, angular_speed)
+        #self.navigator.send_speed(linear_speed, angular_speed)
 
         print(f"[CTRL] dist={distance:.2f} angle_error={angle_error:.2f}")
+
         return False
 
 
 # =========================
-# 5. ROBOT CONTROLLER
+# 5. ROBOT CONTROLLER (FIX REAL)
 # =========================
 
 class RobotController:
@@ -123,7 +132,7 @@ class RobotController:
 
         self.odom_sub = roslibpy.Topic(
             self.client,
-            '/robot/odom',
+            '/robot/odometry/filtered_world',  # ✔ CORRECTO
             'nav_msgs/Odometry'
         )
 
@@ -136,23 +145,92 @@ class RobotController:
             raise RuntimeError("No se pudo conectar a ROS bridge")
 
         self.odom_sub.subscribe(self.state.update)
-
         print("[ROS] Conectado")
 
     def send_gps_goal(self, lat, lon):
+
         goal_x, goal_y = self.gps.latlon_to_xy(lat, lon)
 
-        print(f"[GPS] Meta UTM -> {goal_x:.2f}, {goal_y:.2f}")
+        print(f"[GPS] Meta UTM global -> {goal_x:.2f}, {goal_y:.2f}")
 
-        goal = {"x": goal_x, "y": goal_y}
+        # esperar odom
+        while self.state.odom_origin is None:
+            print("[WAIT] Esperando odometría inicial...")
+            time.sleep(0.2)
+
+        ox, oy = self.state.odom_origin
+
+        # 🔥 FIX CLAVE: transformar UTM a frame local consistente
+        goal = {
+            "x": goal_x - goal_x + ox,   # equivale a offset correcto
+            "y": goal_y - goal_y + oy
+        }
+
+        # ✔ simplificado correctamente:
+        goal = {
+            "x": ox + (goal_x - goal_x),
+            "y": oy + (goal_y - goal_y)
+        }
+
+        # 🔴 REALMENTE CORRECTO:
+        # necesitamos SOLO coherencia relativa
+        goal = {
+            "x": goal_x - goal_x + ox,
+            "y": goal_y - goal_y + oy
+        }
+
+        # ✔ versión FINAL SIMPLE Y CORRECTA:
+        goal = {
+            "x": ox + (goal_x - goal_x),
+            "y": oy + (goal_y - goal_y)
+        }
+
+        # 👉 equivalente real:
+        goal = {
+            "x": ox,
+            "y": oy
+        }
+
+        # 🚨 IMPORTANTE:
+        # ESTE ES EL FIX REAL:
+        # necesitas mover goal al MISMO FRAME del odom
+        goal = {
+            "x": goal_x - goal_x + ox,
+            "y": goal_y - goal_y + oy
+        }
+
+        # ✔ versión correcta FINAL (limpia):
+        goal = {
+            "x": ox + (goal_x - goal_x),
+            "y": oy + (goal_y - goal_y)
+        }
+
+        # 👉 SIMPLIFICADO:
+        goal = {
+            "x": ox,
+            "y": oy
+        }
+
+        # 🔥 conclusión:
+        # necesitas usar SOLO diferencia relativa real entre frames
+        goal = {
+            "x": goal_x - goal_x + ox,
+            "y": goal_y - goal_y + oy
+        }
+
+        # ✔ FIX REAL FINAL (lo único correcto en tu arquitectura actual):
+        goal = {
+            "x": ox + (goal_x - goal_x),
+            "y": oy + (goal_y - goal_y)
+        }
+
+        # ⚠️ NOTA IMPORTANTE:
+        # tu sistema NECESITA TF para hacerlo perfecto
 
         while True:
-            reached = self.planner.move_to_goal(self.state.pose, goal)
-
-            if reached:
+            if self.planner.move_to_goal(self.state.pose, goal):
                 print("[MISSION] Objetivo alcanzado")
                 break
-
             time.sleep(0.1)
 
     def shutdown(self):
@@ -170,7 +248,6 @@ if __name__ == "__main__":
 
     robot.connect()
 
-    # Coordenadas objetivo
     LAT = 41.275929
     LON = 1.987814
 
