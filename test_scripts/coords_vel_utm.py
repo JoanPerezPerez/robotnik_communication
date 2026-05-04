@@ -27,30 +27,63 @@ class RobotState:
         self.odom_origin = None
 
     def update(self, msg):
-
         x = msg["pose"]["pose"]["position"]["x"]
         y = msg["pose"]["pose"]["position"]["y"]
 
-        # fijar origen odom real
         if self.odom_origin is None:
             self.odom_origin = (x, y)
             print(f"[ODOM] Origen fijado -> {self.odom_origin}")
 
-        # convertir a frame local
+        # Posición relativa al origen de odometría
         self.pose["x"] = x - self.odom_origin[0]
         self.pose["y"] = y - self.odom_origin[1]
 
         q = msg["pose"]["pose"]["orientation"]
-        self.pose["yaw"] = self.quaternion_to_yaw(q["x"], q["y"], q["z"], q["w"])
+        self.pose["yaw"] = self._quaternion_to_yaw(q["x"], q["y"], q["z"], q["w"])
 
-    def quaternion_to_yaw(self, x, y, z, w):
+    def _quaternion_to_yaw(self, x, y, z, w):
         siny_cosp = 2 * (w * z + x * y)
         cosy_cosp = 1 - 2 * (y * y + z * z)
         return math.atan2(siny_cosp, cosy_cosp)
 
 
 # =========================
-# 3. NAVIGATOR
+# 3. GPS STATE
+# =========================
+
+class GPSState:
+    """
+    Suscribe a /robot/gps/fix y captura la posición UTM del robot
+    en el momento de arranque, para usarla como origen del frame local.
+    """
+    def __init__(self, gps_converter):
+        self.gps = gps_converter
+        self.origin_utm = None   # (x, y) UTM del robot al arrancar
+
+    def update(self, msg):
+        lat = msg["latitude"]
+        lon = msg["longitude"]
+        x, y = self.gps.latlon_to_xy(lat, lon)
+
+        if self.origin_utm is None:
+            self.origin_utm = (x, y)
+            print(f"[GPS] Origen UTM fijado -> ({x:.2f}, {y:.2f})")
+
+    def goal_to_local(self, goal_utm_x, goal_utm_y):
+        """
+        Transforma coordenadas UTM absolutas del objetivo
+        al frame local del robot (metros desde el origen GPS).
+        """
+        if self.origin_utm is None:
+            raise RuntimeError("GPS origin no disponible aún")
+        return {
+            "x": goal_utm_x - self.origin_utm[0],
+            "y": goal_utm_y - self.origin_utm[1]
+        }
+
+
+# =========================
+# 4. NAVIGATOR
 # =========================
 
 class Navigator:
@@ -64,8 +97,8 @@ class Navigator:
 
     def send_speed(self, linear_x, angular_z):
         msg = roslibpy.Message({
-            'linear': {'x': linear_x, 'y': 0.0, 'z': 0.0},
-            'angular': {'x': 0.0, 'y': 0.0, 'z': angular_z}
+            'linear':  {'x': linear_x, 'y': 0.0, 'z': 0.0},
+            'angular': {'x': 0.0,      'y': 0.0, 'z': angular_z}
         })
         self.cmd_topic.publish(msg)
 
@@ -75,65 +108,102 @@ class Navigator:
 
 
 # =========================
-# 4. TRAJECTORY PLANNER (FIX FINAL)
+# 5. TRAJECTORY PLANNER
 # =========================
 
 class TrajectoryPlanner:
+    """
+    Lazo cerrado de dos fases:
+      Fase 1 - GIRO:    alinear heading al objetivo antes de avanzar.
+      Fase 2 - AVANCE:  avanzar con corrección angular continua.
+    Detiene el robot cuando distance < goal_tolerance (metros).
+    """
+
+    # Parámetros de control
+    GOAL_TOLERANCE   = 1.0    # metros — criterio de parada
+    ANGLE_THRESHOLD  = 0.15   # rad (~8.5°) — umbral para pasar a fase avance
+
+    # Ganancias
+    KP_ANGULAR       = 1.2
+    KP_LINEAR        = 0.15
+
+    # Límites de velocidad
+    MAX_LINEAR       = 0.5    # m/s
+    MIN_LINEAR       = 0.05   # m/s — evita pararse en distancias cortas
+    MAX_ANGULAR      = 0.6    # rad/s
+
     def __init__(self, navigator):
         self.navigator = navigator
 
     def normalize_angle(self, angle):
-        while angle > math.pi:
-            angle -= 2 * math.pi
-        while angle < -math.pi:
-            angle += 2 * math.pi
+        while angle >  math.pi: angle -= 2 * math.pi
+        while angle < -math.pi: angle += 2 * math.pi
         return angle
 
     def move_to_goal(self, current_pose, goal_pose):
-
+        """
+        Llamar en cada tick del lazo de control.
+        Devuelve True cuando el objetivo ha sido alcanzado.
+        """
         dx = goal_pose["x"] - current_pose["x"]
         dy = goal_pose["y"] - current_pose["y"]
+        distance    = math.sqrt(dx**2 + dy**2)
+        target_yaw  = math.atan2(dy, dx)
+        angle_error = self.normalize_angle(target_yaw - current_pose["yaw"])
 
-        distance = math.sqrt(dx**2 + dy**2)
+        print(f"[CTRL] dist={distance:.2f}m  angle_err={math.degrees(angle_error):.1f}°  "
+              f"pos=({current_pose['x']:.2f}, {current_pose['y']:.2f})  "
+              f"goal=({goal_pose['x']:.2f}, {goal_pose['y']:.2f})")
 
-        if distance < 0.5:
+        # ── Criterio de llegada ──────────────────────────────────────────
+        if distance < self.GOAL_TOLERANCE:
             self.navigator.stop()
             return True
 
-        target_angle = math.atan2(dy, dx)
-        angle_error = self.normalize_angle(target_angle - current_pose["yaw"])
+        # ── Fase 1: GIRO puro ────────────────────────────────────────────
+        if abs(angle_error) > self.ANGLE_THRESHOLD:
+            angular_z = self.KP_ANGULAR * angle_error
+            angular_z = max(-self.MAX_ANGULAR, min(self.MAX_ANGULAR, angular_z))
+            #self.navigator.send_speed(0.0, angular_z)                                     
+            return False
 
-        # CONTROL ESTABLE
-        angular_speed = 1.2 * angle_error
-        angular_speed = max(-0.5, min(0.5, angular_speed))
+        # ── Fase 2: AVANCE con corrección angular continua ───────────────
+        linear_x  = self.KP_LINEAR * distance
+        linear_x  = max(self.MIN_LINEAR, min(self.MAX_LINEAR, linear_x))
 
-        linear_speed = 0.2 + 0.2 * distance
-        linear_speed *= max(0.0, 1 - abs(angle_error))
+        # Reducir velocidad lineal si hay error angular residual
+        linear_x *= max(0.3, 1.0 - abs(angle_error))
 
-        #self.navigator.send_speed(linear_speed, angular_speed)
+        angular_z = self.KP_ANGULAR * angle_error
+        angular_z = max(-self.MAX_ANGULAR, min(self.MAX_ANGULAR, angular_z))
 
-        print(f"[CTRL] dist={distance:.2f} angle_error={angle_error:.2f}")
-
+        #self.navigator.send_speed(linear_x, angular_z)
         return False
 
 
 # =========================
-# 5. ROBOT CONTROLLER (FIX REAL)
+# 6. ROBOT CONTROLLER
 # =========================
 
 class RobotController:
     def __init__(self, host, port=9090):
-        self.client = roslibpy.Ros(host=host, port=port)
+        self.client  = roslibpy.Ros(host=host, port=port)
+        self.gps_conv = GPSConverter()
 
-        self.state = RobotState()
-        self.nav = Navigator(self.client)
-        self.gps = GPSConverter()
+        self.state   = RobotState()
+        self.gps_st  = GPSState(self.gps_conv)
+        self.nav     = Navigator(self.client)
         self.planner = TrajectoryPlanner(self.nav)
 
         self.odom_sub = roslibpy.Topic(
             self.client,
-            '/robot/odometry/filtered_world',  # ✔ CORRECTO
+            '/robot/odometry/filtered_world',
             'nav_msgs/Odometry'
+        )
+        self.gps_sub = roslibpy.Topic(
+            self.client,
+            '/robot/gps/fix',
+            'sensor_msgs/NavSatFix'
         )
 
     def connect(self):
@@ -145,112 +215,57 @@ class RobotController:
             raise RuntimeError("No se pudo conectar a ROS bridge")
 
         self.odom_sub.subscribe(self.state.update)
-        print("[ROS] Conectado")
+        self.gps_sub.subscribe(self.gps_st.update)
+        print("[ROS] Conectado y suscrito")
+
+    def _wait_for_origins(self):
+        """Bloquea hasta tener el primer mensaje de odom y de GPS."""
+        print("[WAIT] Esperando origen GPS y odometría...")
+        while self.gps_st.origin_utm is None or self.state.odom_origin is None:
+            time.sleep(0.1)
+        print("[WAIT] Orígenes listos")
 
     def send_gps_goal(self, lat, lon):
+        # 1. Esperar orígenes
+        self._wait_for_origins()
 
-        goal_x, goal_y = self.gps.latlon_to_xy(lat, lon)
+        # 2. Convertir objetivo GPS → UTM → frame local
+        goal_utm_x, goal_utm_y = self.gps_conv.latlon_to_xy(lat, lon)
+        print(f"[GPS] Meta UTM global -> ({goal_utm_x:.2f}, {goal_utm_y:.2f})")
 
-        print(f"[GPS] Meta UTM global -> {goal_x:.2f}, {goal_y:.2f}")
+        goal_local = self.gps_st.goal_to_local(goal_utm_x, goal_utm_y)
+        print(f"[GPS] Meta en frame local -> ({goal_local['x']:.2f}, {goal_local['y']:.2f})")
 
-        # esperar odom
-        while self.state.odom_origin is None:
-            print("[WAIT] Esperando odometría inicial...")
-            time.sleep(0.2)
-
-        ox, oy = self.state.odom_origin
-
-        # 🔥 FIX CLAVE: transformar UTM a frame local consistente
-        goal = {
-            "x": goal_x - goal_x + ox,   # equivale a offset correcto
-            "y": goal_y - goal_y + oy
-        }
-
-        # ✔ simplificado correctamente:
-        goal = {
-            "x": ox + (goal_x - goal_x),
-            "y": oy + (goal_y - goal_y)
-        }
-
-        # 🔴 REALMENTE CORRECTO:
-        # necesitamos SOLO coherencia relativa
-        goal = {
-            "x": goal_x - goal_x + ox,
-            "y": goal_y - goal_y + oy
-        }
-
-        # ✔ versión FINAL SIMPLE Y CORRECTA:
-        goal = {
-            "x": ox + (goal_x - goal_x),
-            "y": oy + (goal_y - goal_y)
-        }
-
-        # 👉 equivalente real:
-        goal = {
-            "x": ox,
-            "y": oy
-        }
-
-        # 🚨 IMPORTANTE:
-        # ESTE ES EL FIX REAL:
-        # necesitas mover goal al MISMO FRAME del odom
-        goal = {
-            "x": goal_x - goal_x + ox,
-            "y": goal_y - goal_y + oy
-        }
-
-        # ✔ versión correcta FINAL (limpia):
-        goal = {
-            "x": ox + (goal_x - goal_x),
-            "y": oy + (goal_y - goal_y)
-        }
-
-        # 👉 SIMPLIFICADO:
-        goal = {
-            "x": ox,
-            "y": oy
-        }
-
-        # 🔥 conclusión:
-        # necesitas usar SOLO diferencia relativa real entre frames
-        goal = {
-            "x": goal_x - goal_x + ox,
-            "y": goal_y - goal_y + oy
-        }
-
-        # ✔ FIX REAL FINAL (lo único correcto en tu arquitectura actual):
-        goal = {
-            "x": ox + (goal_x - goal_x),
-            "y": oy + (goal_y - goal_y)
-        }
-
-        # ⚠️ NOTA IMPORTANTE:
-        # tu sistema NECESITA TF para hacerlo perfecto
-
+        # 3. Lazo cerrado de control
+        print("[MISSION] Iniciando navegación...")
         while True:
-            if self.planner.move_to_goal(self.state.pose, goal):
-                print("[MISSION] Objetivo alcanzado")
+            reached = self.planner.move_to_goal(self.state.pose, goal_local)
+            if reached:
+                print("[MISSION] Objetivo alcanzado ✓")
                 break
             time.sleep(0.1)
 
     def shutdown(self):
         self.nav.stop()
         self.client.terminate()
+        print("[ROS] Desconectado")
 
 
 # =========================
-# 6. MAIN
+# 7. MAIN
 # =========================
 
 if __name__ == "__main__":
 
     robot = RobotController(host="100.99.163.44")
 
-    robot.connect()
+    try:
+        robot.connect()
 
-    LAT = 41.275929
-    LON = 1.987814
+        LAT = 41.275929
+        LON = 1.987814
 
-    robot.send_gps_goal(LAT, LON)
+        robot.send_gps_goal(LAT, LON)
 
-    robot.shutdown()
+    finally:
+        robot.shutdown()
