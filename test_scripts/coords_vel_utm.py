@@ -27,6 +27,7 @@ class RobotState:
         self.odom_origin = None
 
     def update(self, msg):
+        #print(msg)
         x = msg["pose"]["pose"]["position"]["x"]
         y = msg["pose"]["pose"]["position"]["y"]
 
@@ -164,7 +165,7 @@ class TrajectoryPlanner:
         if abs(angle_error) > self.ANGLE_THRESHOLD:
             angular_z = self.KP_ANGULAR * angle_error
             angular_z = max(-self.MAX_ANGULAR, min(self.MAX_ANGULAR, angular_z))
-            #self.navigator.send_speed(0.0, angular_z)                                     
+            self.navigator.send_speed(0.0, angular_z)                                     
             return False
 
         # ── Fase 2: AVANCE con corrección angular continua ───────────────
@@ -177,7 +178,7 @@ class TrajectoryPlanner:
         angular_z = self.KP_ANGULAR * angle_error
         angular_z = max(-self.MAX_ANGULAR, min(self.MAX_ANGULAR, angular_z))
 
-        #self.navigator.send_speed(linear_x, angular_z)
+        self.navigator.send_speed(linear_x, angular_z)
         return False
 
 
