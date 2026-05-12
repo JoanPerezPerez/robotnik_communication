@@ -3,10 +3,12 @@ import paho.mqtt.client as mqtt
 from paho.mqtt.client import CallbackAPIVersion
 import time
 #from coords import coords_to_ros
+from coords_vel_utm import RobotController
 
 BROKER_HOST = "127.0.0.1"                     
 BROKER_PORT = 8008
 TOPIC_GPS = "drone/telemetry/gps" 
+robot = RobotController(host="100.99.163.44")
 
 def on_connect(client, userdata, flags, rc, properties):
     print("Connected with result code", rc)
@@ -24,6 +26,12 @@ def on_message(client, userdata, msg):
         if detection: 
             print(latitude, longitude, timestamp) 
             #coords_to_ros(latitude, longitude)
+            try:
+                robot.connect()
+                robot.send_gps_goal(latitude, longitude)
+
+            finally:
+                robot.shutdown()
         
     except json.JSONDecodeError as e:
         print("Error al parsear JSON:", e)

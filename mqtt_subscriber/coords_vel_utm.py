@@ -263,8 +263,8 @@ if __name__ == "__main__":
     try:
         robot.connect()
 
-        LAT = 41.275929
-        LON = 1.987814
+        LAT = 41.275767
+        LON = 1.987191
 
         robot.send_gps_goal(LAT, LON)
 
